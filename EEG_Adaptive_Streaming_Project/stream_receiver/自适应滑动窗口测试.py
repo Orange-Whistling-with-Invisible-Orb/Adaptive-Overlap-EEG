@@ -77,6 +77,22 @@ def _resolve_stfnet_ckpt(ckpt_arg: str, project_root_dir: str) -> str:
     )
 
 
+def _resolve_fusion_weight_ckpt(ckpt_arg: str, project_root_dir: str) -> str:
+    p = Path(ckpt_arg)
+    if p.exists():
+        return str(p.resolve())
+
+    project_root_path = Path(project_root_dir)
+    candidates = list(project_root_path.glob("results/**/*.pth"))
+    if candidates:
+        best = max(candidates, key=lambda x: x.stat().st_mtime)
+        print(f"[FusionWeight] 指定路径不存在，已自动回退到: {best}")
+        return str(best.resolve())
+    raise FileNotFoundError(
+        f"Fusion weight checkpoint not found: {ckpt_arg}. No .pth found under results/."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="自适应重叠率滑动窗口流式测试程序")
     parser.add_argument(
@@ -100,6 +116,18 @@ def main():
     )
     parser.add_argument("--stfnet_device", type=str, default="cuda:0", help="STFNet 推理设备")
     parser.add_argument(
+        "--fusion_weight_ckpt",
+        type=str,
+        default="",
+        help="双尺度权重网络参数路径（为空则禁用学习权重，使用均值融合）",
+    )
+    parser.add_argument(
+        "--fusion_weight_device",
+        type=str,
+        default="cuda:0",
+        help="双尺度权重网络推理设备",
+    )
+    parser.add_argument(
         "--no-stfnet",
         action="store_true",
         help="关闭 STFNet 窗口级预处理（默认开启）",
@@ -112,8 +140,13 @@ def main():
     args = parser.parse_args()
 
     stfnet_ckpt = None
+    fusion_weight_ckpt = None
     if not args.no_stfnet:
         stfnet_ckpt = _resolve_stfnet_ckpt(args.stfnet_ckpt, project_root)
+    if args.fusion_weight_ckpt.strip():
+        fusion_weight_ckpt = _resolve_fusion_weight_ckpt(
+            args.fusion_weight_ckpt.strip(), project_root
+        )
     window_manager = AdaptiveWindowManager(
         window_size=args.window_len,
         N=args.overlap_n,
@@ -121,6 +154,8 @@ def main():
         stfnet_checkpoint=stfnet_ckpt,
         stfnet_device=args.stfnet_device,
         stfnet_input_len=500,
+        fusion_weight_checkpoint=fusion_weight_ckpt,
+        fusion_weight_device=args.fusion_weight_device,
     )
     print("🚀 启动流式测试...")
     print(f"配置: L={window_manager.L}, N={window_manager.N}, S={window_manager.S}")
@@ -138,6 +173,12 @@ def main():
         print("[Config] STFNet: disabled")
     else:
         print(f"[Config] STFNet: enabled, ckpt={stfnet_ckpt}, device={args.stfnet_device}")
+    if fusion_weight_ckpt is None:
+        print("[Config] FusionWeight: disabled (均值融合)")
+    else:
+        print(
+            f"[Config] FusionWeight: enabled, ckpt={fusion_weight_ckpt}, device={args.fusion_weight_device}"
+        )
 
     receiver = EEGReceiver(host=args.host, port=args.port)
     window_manager.on_reconstructed_chunk = handle_reconstructed_data
@@ -170,6 +211,7 @@ def main():
         last_chunk_count = 0
         last_latency_idx = 0
         last_stf_idx = 0
+        last_wf_idx = 0
 
         while True:
             time.sleep(1)
@@ -214,16 +256,26 @@ def main():
                         if window_manager.last_stfnet_infer_ms is not None
                         else 0.0
                     )
+                    wf_all = window_manager.weight_infer_ms
+                    wf_recent = wf_all[last_wf_idx:] if wf_all else []
+                    wf_recent_avg = statistics.fmean(wf_recent) if wf_recent else 0.0
+                    wf_latest = (
+                        window_manager.last_weight_infer_ms
+                        if window_manager.last_weight_infer_ms is not None
+                        else 0.0
+                    )
 
                     print(
                         f"[Status] 累计包数={packet_count}, 累计输出块数={chunk_count}, "
                         f"近2秒新增包={d_packet}, 新增输出块={d_chunk}, "
                         f"近2秒窗口时延均值={recent_avg:.1f}ms, 近2秒P95={recent_p95:.1f}ms, "
                         f"最新窗口时延={latest_latency:.1f}ms, 全局均值={global_avg:.1f}ms, "
-                        f"近2秒STFNet均值={stf_recent_avg:.1f}ms, 最新STFNet={stf_latest:.1f}ms"
+                        f"近2秒STFNet均值={stf_recent_avg:.1f}ms, 最新STFNet={stf_latest:.1f}ms, "
+                        f"近2秒权重网络均值={wf_recent_avg:.1f}ms, 最新权重网络={wf_latest:.1f}ms"
                     )
                     last_latency_idx = len(all_latencies)
                     last_stf_idx = len(stf_all)
+                    last_wf_idx = len(wf_all)
 
                 last_packet_count = packet_count
                 last_chunk_count = chunk_count

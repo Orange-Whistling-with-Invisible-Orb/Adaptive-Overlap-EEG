@@ -90,6 +90,120 @@ class STFNetWindowDenoiser:
         return out
 
 
+class DualScaleWeightInferencer:
+    """
+    双尺度位置评估头推理器。
+    输入 K 个窗口 [K, C, L]，输出 softmax 权重 [K]。
+    """
+
+    def __init__(
+        self,
+        checkpoint_path,
+        n_channels: int,
+        window_len: int,
+        device="cpu",
+    ):
+        self.checkpoint_path = Path(checkpoint_path)
+        self.n_channels = int(n_channels)
+        self.window_len = int(window_len)
+        if not self.checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Fusion weight checkpoint not found: {self.checkpoint_path}"
+            )
+        try:
+            import torch
+        except Exception as e:
+            raise ImportError(f"Failed to import torch for fusion scorer: {e}") from e
+
+        self.torch = torch
+        self.device = self._resolve_device(device)
+        self.model = self._load_model()
+        self.model.eval().to(self.device)
+
+    def _resolve_device(self, device):
+        device = str(device)
+        if device.startswith("cuda") and not self.torch.cuda.is_available():
+            print("[FusionWeight] CUDA unavailable, fallback to CPU.")
+            return self.torch.device("cpu")
+        return self.torch.device(device)
+
+    def _load_model(self):
+        project_root = Path(__file__).resolve().parents[1]
+        if str(project_root) not in sys.path:
+            sys.path.append(str(project_root))
+
+        from core_algorithm.dual_scale_scorer import DualScalePositionScorer
+
+        try:
+            ckpt = self.torch.load(
+                str(self.checkpoint_path),
+                map_location=self.device,
+                weights_only=False,
+            )
+        except TypeError:
+            ckpt = self.torch.load(str(self.checkpoint_path), map_location=self.device)
+
+        # 1) 若直接存的是模型对象
+        if hasattr(ckpt, "forward") and hasattr(ckpt, "state_dict"):
+            return ckpt
+
+        # 2) 常规 state_dict 格式
+        if not isinstance(ckpt, dict):
+            raise TypeError(
+                f"Unsupported fusion checkpoint format: {type(ckpt)} at {self.checkpoint_path}"
+            )
+
+        model = DualScalePositionScorer(
+            n_channels=int(ckpt.get("n_channels", self.n_channels)),
+            window_len=int(ckpt.get("window_len", self.window_len)),
+            local_kernel=int(ckpt.get("local_kernel", 15)),
+        )
+        state_dict = ckpt.get("state_dict", ckpt)
+        cleaned = {}
+        for k, v in state_dict.items():
+            nk = k.replace("module.", "")
+            if nk.startswith("scorer."):
+                nk = nk[len("scorer.") :]
+            cleaned[nk] = v
+        model.load_state_dict(cleaned, strict=False)
+        return model
+
+    @staticmethod
+    def _resample_stack_time(windows, target_len):
+        # windows: [K, C, T] -> [K, C, target_len]
+        if windows.shape[-1] == target_len:
+            return windows
+        out = []
+        for i in range(windows.shape[0]):
+            out.append(STFNetWindowDenoiser._resample_time(windows[i], target_len))
+        return np.stack(out, axis=0).astype(np.float32)
+
+    def predict(self, windows_kcl: np.ndarray) -> np.ndarray:
+        """
+        windows_kcl: [K, C, L]
+        """
+        windows = np.asarray(windows_kcl, dtype=np.float32)
+        if windows.ndim != 3:
+            raise ValueError(
+                f"DualScaleWeightInferencer expects [K,C,L], got {windows.shape}"
+            )
+        k, c, l = windows.shape
+        if c != self.n_channels:
+            raise ValueError(f"Channel mismatch: expected {self.n_channels}, got {c}")
+        if l != self.window_len:
+            windows = self._resample_stack_time(windows, self.window_len)
+
+        x = self.torch.from_numpy(windows).unsqueeze(0).to(self.device)  # [1,K,C,L]
+        with self.torch.no_grad():
+            _, weights = self.model(x)  # [1,K]
+        w = weights.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+        s = float(w.sum())
+        if s <= 0:
+            return np.ones((k,), dtype=np.float32) / max(1, k)
+        return w / s
+
+
 class AdaptiveWindowManager:
     """
     自适应多重叠率滑动窗口管理器 (V3)
@@ -103,6 +217,8 @@ class AdaptiveWindowManager:
         stfnet_checkpoint=None,
         stfnet_device="cpu",
         stfnet_input_len=500,
+        fusion_weight_checkpoint=None,
+        fusion_weight_device="cpu",
     ):
         """
         参数:
@@ -138,12 +254,31 @@ class AdaptiveWindowManager:
             print(
                 f"[STFNet] Enabled. ckpt={stfnet_checkpoint}, device={self.stfnet_denoiser.device}"
             )
+
+        self.weight_inferencer = None
+        self.weight_enabled = fusion_weight_checkpoint is not None
+        self.last_weight_infer_ms = None
+        self.weight_infer_ms = []
+        self.last_weight_vector = None
+        if self.weight_enabled:
+            self.weight_inferencer = DualScaleWeightInferencer(
+                checkpoint_path=fusion_weight_checkpoint,
+                n_channels=self.n_channels,
+                window_len=self.L,
+                device=fusion_weight_device,
+            )
+            print(
+                f"[FusionWeight] Enabled. ckpt={fusion_weight_checkpoint}, device={self.weight_inferencer.device}"
+            )
         
         # 缓冲区初始化
         self.input_buffer = np.empty((n_channels, 0), dtype=np.float32)
         self.input_time_buffer = np.empty((0,), dtype=np.float64)
         self.ola_buffer = np.zeros((n_channels, self.L), dtype=np.float32)
         self.count_buffer = np.zeros(self.L, dtype=np.float32)
+        self.active_full_windows = []
+        self.active_shifted_windows = []
+        self.active_remaining_steps = []
         
         self.reconstructed_count = 0 
         self.on_reconstructed_chunk = None
@@ -172,13 +307,31 @@ class AdaptiveWindowManager:
             else:
                 processed_window = window
 
-            # 叠加至重构缓冲区
-            self.ola_buffer += processed_window
-            self.count_buffer += 1.0
+            if self.weight_inferencer is not None:
+                # 进入“可学习权重”融合分支
+                self.active_full_windows.append(processed_window)
+                self.active_shifted_windows.append(processed_window.copy())
+                self.active_remaining_steps.append(self.max_overlap_count)
 
-            # 提取前 S 个点并归一化输出
-            counts = self.count_buffer[:self.S]
-            reconstructed_chunk = self.ola_buffer[:, :self.S] / (counts + 1e-8)
+                full_stack = np.stack(self.active_full_windows, axis=0)  # [K,C,L]
+                weight_t0 = time.perf_counter() * 1000.0
+                weights = self.weight_inferencer.predict(full_stack)  # [K]
+                self.last_weight_infer_ms = (time.perf_counter() * 1000.0) - weight_t0
+                self.weight_infer_ms.append(float(self.last_weight_infer_ms))
+                self.last_weight_vector = weights.copy()
+
+                seg_stack = np.stack(
+                    [w[:, : self.S] for w in self.active_shifted_windows], axis=0
+                )  # [K,C,S]
+                reconstructed_chunk = np.sum(
+                    seg_stack * weights[:, None, None], axis=0, dtype=np.float32
+                )
+            else:
+                # 旧版“均值融合”分支
+                self.ola_buffer += processed_window
+                self.count_buffer += 1.0
+                counts = self.count_buffer[:self.S]
+                reconstructed_chunk = self.ola_buffer[:, :self.S] / (counts + 1e-8)
 
             # 使用输出块最早样本的接收时间作为起点，衡量窗口完整输出时延
             chunk_start_receive_time_ms = (
@@ -203,15 +356,41 @@ class AdaptiveWindowManager:
             # 缓冲区步进滑动
             self.input_buffer = self.input_buffer[:, self.S:]
             self.input_time_buffer = self.input_time_buffer[self.S:]
-            
-            # 信号叠加区左移 S
-            self.ola_buffer = np.concatenate([
-                self.ola_buffer[:, self.S:], 
-                np.zeros((self.n_channels, self.S), dtype=np.float32)
-            ], axis=1)
-            
-            # 计数区同步左移 S
-            self.count_buffer = np.concatenate([
-                self.count_buffer[self.S:], 
-                np.zeros(self.S, dtype=np.float32)
-            ])
+
+            if self.weight_inferencer is not None:
+                # 学习权重分支下，推进每个活动窗口状态
+                new_full = []
+                new_shifted = []
+                new_remaining = []
+                for full_w, shifted_w, rem in zip(
+                    self.active_full_windows,
+                    self.active_shifted_windows,
+                    self.active_remaining_steps,
+                ):
+                    shifted_next = np.concatenate(
+                        [
+                            shifted_w[:, self.S :],
+                            np.zeros((self.n_channels, self.S), dtype=np.float32),
+                        ],
+                        axis=1,
+                    )
+                    rem = rem - 1
+                    if rem > 0:
+                        new_full.append(full_w)
+                        new_shifted.append(shifted_next)
+                        new_remaining.append(rem)
+                self.active_full_windows = new_full
+                self.active_shifted_windows = new_shifted
+                self.active_remaining_steps = new_remaining
+            else:
+                # 均值融合分支保持原逻辑
+                self.ola_buffer = np.concatenate(
+                    [
+                        self.ola_buffer[:, self.S :],
+                        np.zeros((self.n_channels, self.S), dtype=np.float32),
+                    ],
+                    axis=1,
+                )
+                self.count_buffer = np.concatenate(
+                    [self.count_buffer[self.S :], np.zeros(self.S, dtype=np.float32)]
+                )
