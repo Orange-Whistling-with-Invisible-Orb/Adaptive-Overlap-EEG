@@ -93,7 +93,14 @@ class STFNetWindowDenoiser:
 class DualScaleWeightInferencer:
     """
     双尺度位置评估头推理器。
-    输入 K 个窗口 [K, C, L]，输出 softmax 权重 [K]。
+    输入 K 个窗口 [K, C, L]，可输出：
+    - 位置相关 softmax 权重 [K, S]（normalize=True）
+    - 位置相关未约束 logits [K, S]（normalize=False）
+    兼容旧调用：未指定 chunk_len 时，返回窗口级平均权重 [K]。
+
+    说明：
+    - 训练端使用“logits + 初始位置偏置 -> softmax(logits / temperature)”得到权重；
+    - 推理端这里对齐同一规则，避免训练/推理机制不一致带来的数值漂移。
     """
 
     def __init__(
@@ -117,6 +124,9 @@ class DualScaleWeightInferencer:
 
         self.torch = torch
         self.device = self._resolve_device(device)
+        self.softmax_temperature = 1.0
+        self.init_logit_bias_strength = 0.0
+        self.init_window_weights = None
         self.model = self._load_model()
         self.model.eval().to(self.device)
 
@@ -153,6 +163,14 @@ class DualScaleWeightInferencer:
                 f"Unsupported fusion checkpoint format: {type(ckpt)} at {self.checkpoint_path}"
             )
 
+        self.softmax_temperature = float(max(1e-6, ckpt.get("softmax_temperature", 1.0)))
+        self.init_logit_bias_strength = float(
+            max(0.0, ckpt.get("init_logit_bias_strength", 0.0))
+        )
+        self.init_window_weights = self._normalize_init_window_weights(
+            ckpt.get("init_window_weights", None)
+        )
+
         model = DualScalePositionScorer(
             n_channels=int(ckpt.get("n_channels", self.n_channels)),
             window_len=int(ckpt.get("window_len", self.window_len)),
@@ -178,9 +196,75 @@ class DualScaleWeightInferencer:
             out.append(STFNetWindowDenoiser._resample_time(windows[i], target_len))
         return np.stack(out, axis=0).astype(np.float32)
 
-    def predict(self, windows_kcl: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _softmax_over_windows(logits: np.ndarray) -> np.ndarray:
+        """对每个时刻沿 K 维做 softmax，得到正数且列和为 1 的权重。"""
+        shifted = logits - np.max(logits, axis=0, keepdims=True)
+        exp_logits = np.exp(shifted)
+        denom = np.sum(exp_logits, axis=0, keepdims=True)
+        return exp_logits / np.clip(denom, 1e-12, None)
+
+    @staticmethod
+    def _normalize_init_window_weights(init_window_weights):
+        if init_window_weights is None:
+            return None
+        arr = np.asarray(init_window_weights, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            return None
+        if not np.isfinite(arr).all():
+            return None
+        arr = np.clip(arr, 0.0, None)
+        s = float(arr.sum())
+        if s <= 0:
+            return None
+        return arr / s
+
+    def _apply_initial_position_bias(self, logits: np.ndarray) -> np.ndarray:
+        """
+        logits: [K, S]
+        与训练端 _apply_initial_position_bias 保持一致。
+        """
+        if logits.ndim != 2:
+            return logits
+        k, _ = logits.shape
+        if k <= 1:
+            return logits
+
+        if self.init_window_weights is not None:
+            base = np.asarray(self.init_window_weights, dtype=np.float32).reshape(-1)
+            if base.size == k:
+                prior_w = base
+            else:
+                # 线性插值到当前活跃窗口数 K，并归一化。
+                src_x = np.linspace(0.0, 1.0, num=base.size, dtype=np.float32)
+                dst_x = np.linspace(0.0, 1.0, num=k, dtype=np.float32)
+                prior_w = np.interp(dst_x, src_x, base).astype(np.float32)
+                prior_w = np.clip(prior_w, 1e-6, None)
+                prior_w = prior_w / np.clip(float(prior_w.sum()), 1e-12, None)
+            prior_logit = np.log(prior_w + 1e-12)
+            prior_logit = prior_logit - np.mean(prior_logit)
+            return logits + prior_logit[:, None]
+
+        if self.init_logit_bias_strength <= 0:
+            return logits
+        pos = np.linspace(-1.0, 1.0, num=k, dtype=np.float32)
+        prior = (pos**2) - np.mean(pos**2)
+        return logits + float(self.init_logit_bias_strength) * prior[:, None]
+
+    def predict(
+        self,
+        windows_kcl: np.ndarray,
+        chunk_len: int | None = None,
+        normalize: bool = True,
+    ) -> np.ndarray:
         """
         windows_kcl: [K, C, L]
+        chunk_len:
+            - 指定时返回 [K, chunk_len] 的位置相关权重
+            - 不指定时返回 [K]（对全窗口位置权重取均值后的兼容输出）
+        normalize:
+            - True: 返回沿 K 维归一化后的 softmax 权重（非负，列和为 1）
+            - False: 返回未归一化 logits（可正可负，列和不受约束）
         """
         windows = np.asarray(windows_kcl, dtype=np.float32)
         if windows.ndim != 3:
@@ -193,15 +277,35 @@ class DualScaleWeightInferencer:
         if l != self.window_len:
             windows = self._resample_stack_time(windows, self.window_len)
 
+        return_vector = chunk_len is None
+        out_len = self.window_len if chunk_len is None else int(chunk_len)
+        if out_len < 1 or out_len > self.window_len:
+            raise ValueError(
+                f"chunk_len must be in [1, {self.window_len}], got {out_len}"
+            )
+
         x = self.torch.from_numpy(windows).unsqueeze(0).to(self.device)  # [1,K,C,L]
         with self.torch.no_grad():
-            _, weights = self.model(x)  # [1,K]
-        w = weights.squeeze(0).detach().cpu().numpy().astype(np.float32)
-        w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-        s = float(w.sum())
-        if s <= 0:
-            return np.ones((k,), dtype=np.float32) / max(1, k)
-        return w / s
+            logits, _ = self.model(x, output_len=out_len)  # [1,K,out_len]
+        logits_np = logits.squeeze(0).detach().cpu().numpy().astype(np.float32)  # [K,out_len]
+        logits_np = np.nan_to_num(logits_np, nan=0.0, posinf=0.0, neginf=0.0)
+        biased_logits = self._apply_initial_position_bias(logits_np)
+
+        if normalize:
+            scaled_logits = biased_logits / float(self.softmax_temperature)
+            w = self._softmax_over_windows(scaled_logits).astype(np.float32)
+        else:
+            w = biased_logits.astype(np.float32)
+
+        if return_vector:
+            w_vec = np.mean(w, axis=1).astype(np.float32)
+            if not normalize:
+                return w_vec
+            s = float(w_vec.sum())
+            if s <= 0:
+                return np.ones((k,), dtype=np.float32) / max(1, k)
+            return w_vec / s
+        return w
 
 
 class AdaptiveWindowManager:
@@ -219,6 +323,7 @@ class AdaptiveWindowManager:
         stfnet_input_len=500,
         fusion_weight_checkpoint=None,
         fusion_weight_device="cpu",
+        fusion_use_unconstrained_logits=False,
     ):
         """
         参数:
@@ -255,11 +360,18 @@ class AdaptiveWindowManager:
                 f"[STFNet] Enabled. ckpt={stfnet_checkpoint}, device={self.stfnet_denoiser.device}"
             )
 
+        self.direct_passthrough = self.N == 1
+        self.fusion_use_unconstrained_logits = bool(fusion_use_unconstrained_logits)
         self.weight_inferencer = None
-        self.weight_enabled = fusion_weight_checkpoint is not None
+        if self.direct_passthrough and fusion_weight_checkpoint is not None:
+            print("[FusionWeight] N=1 mode: bypass fusion scorer and use direct STFNet output.")
+        self.weight_enabled = (
+            fusion_weight_checkpoint is not None and not self.direct_passthrough
+        )
         self.last_weight_infer_ms = None
         self.weight_infer_ms = []
         self.last_weight_vector = None
+        self.last_weight_map = None
         if self.weight_enabled:
             self.weight_inferencer = DualScaleWeightInferencer(
                 checkpoint_path=fusion_weight_checkpoint,
@@ -267,8 +379,14 @@ class AdaptiveWindowManager:
                 window_len=self.L,
                 device=fusion_weight_device,
             )
+            fusion_mode = (
+                "unconstrained_logits"
+                if self.fusion_use_unconstrained_logits
+                else "softmax_normalized"
+            )
             print(
-                f"[FusionWeight] Enabled. ckpt={fusion_weight_checkpoint}, device={self.weight_inferencer.device}"
+                f"[FusionWeight] Enabled. ckpt={fusion_weight_checkpoint}, "
+                f"device={self.weight_inferencer.device}, mode={fusion_mode}"
             )
         
         # 缓冲区初始化
@@ -307,24 +425,34 @@ class AdaptiveWindowManager:
             else:
                 processed_window = window
 
-            if self.weight_inferencer is not None:
+            if self.direct_passthrough:
+                # N=1 严格退化：直接输出 STFNet 窗口，不经过融合打分网络。
+                reconstructed_chunk = processed_window[:, : self.S]
+            elif self.weight_inferencer is not None:
                 # 进入“可学习权重”融合分支
                 self.active_full_windows.append(processed_window)
                 self.active_shifted_windows.append(processed_window.copy())
                 self.active_remaining_steps.append(self.max_overlap_count)
 
-                full_stack = np.stack(self.active_full_windows, axis=0)  # [K,C,L]
+                # 与训练保持一致：使用 active_shifted 作为打分输入
+                score_stack = np.stack(self.active_shifted_windows, axis=0)  # [K,C,L]
                 weight_t0 = time.perf_counter() * 1000.0
-                weights = self.weight_inferencer.predict(full_stack)  # [K]
+                # 默认使用与训练一致的 softmax 归一化权重，避免数值爆炸。
+                weights = self.weight_inferencer.predict(
+                    score_stack,
+                    chunk_len=self.S,
+                    normalize=(not self.fusion_use_unconstrained_logits),
+                )  # [K,S]
                 self.last_weight_infer_ms = (time.perf_counter() * 1000.0) - weight_t0
                 self.weight_infer_ms.append(float(self.last_weight_infer_ms))
-                self.last_weight_vector = weights.copy()
+                self.last_weight_map = weights.copy()
+                self.last_weight_vector = np.mean(weights, axis=1).astype(np.float32)
 
                 seg_stack = np.stack(
                     [w[:, : self.S] for w in self.active_shifted_windows], axis=0
                 )  # [K,C,S]
                 reconstructed_chunk = np.sum(
-                    seg_stack * weights[:, None, None], axis=0, dtype=np.float32
+                    seg_stack * weights[:, None, :], axis=0, dtype=np.float32
                 )
             else:
                 # 旧版“均值融合”分支
@@ -357,7 +485,10 @@ class AdaptiveWindowManager:
             self.input_buffer = self.input_buffer[:, self.S:]
             self.input_time_buffer = self.input_time_buffer[self.S:]
 
-            if self.weight_inferencer is not None:
+            if self.direct_passthrough:
+                # N=1 直通模式无活动窗口状态。
+                pass
+            elif self.weight_inferencer is not None:
                 # 学习权重分支下，推进每个活动窗口状态
                 new_full = []
                 new_shifted = []

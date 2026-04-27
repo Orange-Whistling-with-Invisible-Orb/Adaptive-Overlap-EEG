@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE
+.vscode/
+
+# Notebooks
+*.ipynb
+
+# Experiment data and outputs
+EEG_Adaptive_Streaming_Project/data/
+EEG_Adaptive_Streaming_Project/results/
+EEG_Adaptive_Streaming_Project/simulation/outcome/
+EEG_Adaptive_Streaming_Project/stfnet_module/checkpoints/
+EEG_Adaptive_Streaming_Project/stream_receiver/delay_log.txt
+EEG_Adaptive_Streaming_Project/stream_receiver/延时情况/
+
+# Model artifacts
+*.pth
+*.pt
+
+# Thesis and paper assets
+thesis/
+whuthesis/
+whuthesis.zip
+
+# Misc binary docs
+*.pdf
+*.synctex.gz

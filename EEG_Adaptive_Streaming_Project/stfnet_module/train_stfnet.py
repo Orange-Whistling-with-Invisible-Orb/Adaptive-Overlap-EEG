@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--folds", type=int, default=10)
+    parser.add_argument("--folds", type=int, default=1)
     parser.add_argument(
         "--keep_fold_models",
         action="store_true",

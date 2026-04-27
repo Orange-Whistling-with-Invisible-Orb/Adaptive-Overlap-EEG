@@ -13,7 +13,7 @@ import numpy as np
 def parse_args() -> argparse.Namespace:
     # Keep training args aligned with train_stfnet.py.
     parser = argparse.ArgumentParser(
-        description="Pick one dataset from top-length 15% pool and train STFNet"
+        description="Randomly pick multiple datasets from top-length pool and train STFNet"
     )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--save_dir", type=str, default="stfnet_module/checkpoints")
@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--folds", type=int, default=10)
+    parser.add_argument("--folds", type=int, default=1)
 
     # Selection-specific args.
     parser.add_argument("--contaminated_dir", type=str, default="data/contaminated")
@@ -38,7 +38,13 @@ def parse_args() -> argparse.Namespace:
         "--top_ratio",
         type=float,
         default=0.15,
-        help="Select random one from top ratio by length",
+        help="Candidate pool ratio by length (descending)",
+    )
+    parser.add_argument(
+        "--pick_count",
+        type=int,
+        default=5,
+        help="Randomly pick this many datasets from top pool",
     )
     parser.add_argument(
         "--min_len",
@@ -79,9 +85,13 @@ def _collect_pair_lengths(
     return out
 
 
-def _pick_one_top15(
-    pairs: list[tuple[int, Path, Path, str]], top_ratio: float, min_len: int, seed: int
-) -> tuple[Path, Path, str, int]:
+def _pick_topk_from_pool(
+    pairs: list[tuple[int, Path, Path, str]],
+    top_ratio: float,
+    min_len: int,
+    seed: int,
+    pick_count: int,
+) -> list[tuple[Path, Path, str, int]]:
     valid = [p for p in pairs if p[0] >= min_len]
     if not valid:
         raise ValueError(
@@ -91,25 +101,39 @@ def _pick_one_top15(
     valid.sort(key=lambda z: z[0], reverse=True)
     top_n = max(1, math.ceil(len(valid) * top_ratio))
     top_pool = valid[:top_n]
+    if len(top_pool) < 2:
+        raise ValueError(
+            f"Top pool too small for random multi-dataset training. top_pool={len(top_pool)}, "
+            f"valid={len(valid)}, top_ratio={top_ratio:.3f}"
+        )
+    if pick_count <= 0:
+        raise ValueError("--pick_count must be > 0")
+    if pick_count > len(top_pool):
+        raise ValueError(
+            f"pick_count={pick_count} exceeds top pool size={len(top_pool)}. "
+            "Lower --pick_count or increase --top_ratio."
+        )
 
     rng = np.random.default_rng(seed)
-    idx = int(rng.integers(0, len(top_pool)))
-    t, nos_path, pure_path, sid = top_pool[idx]
+    chosen_idx = rng.choice(len(top_pool), size=pick_count, replace=False)
+    selected = [top_pool[int(i)] for i in chosen_idx]
 
     print(f"Valid pairs: {len(valid)}")
     print(f"Top pool size ({top_ratio:.2%}): {len(top_pool)}")
-    print(f"Selected sid: {sid}, length: {t}")
-    return nos_path, pure_path, sid, t
+    print(f"Selected datasets: {len(selected)}")
+    for t, _, _, sid in selected:
+        print(f"- sid={sid}, length={t}")
+    return [(nos_path, pure_path, sid, t) for t, nos_path, pure_path, sid in selected]
 
 
 def _run_training(
-    args: argparse.Namespace, eeg_path: Path, nos_path: Path, sid: str
+    args: argparse.Namespace, eeg_path: Path, nos_path: Path, run_suffix: str
 ) -> None:
     project_root = Path(__file__).resolve().parents[1]
     train_script = project_root / "stfnet_module" / "train_stfnet.py"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"run_{timestamp}_{sid}"
+    run_name = f"run_{timestamp}_{run_suffix}"
     save_dir_ts = Path(args.save_dir) / run_name
     log_dir_ts = Path(args.log_dir) / run_name
 
@@ -150,6 +174,49 @@ def _run_training(
     print(f"[run] best checkpoint: {best_overall}")
 
 
+def _merge_selected(
+    selected: list[tuple[Path, Path, str, int]], merged_dir: Path, timestamp: str
+) -> tuple[Path, Path, str]:
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    sids: list[str] = []
+    min_t = None
+    min_c = None
+
+    for nos_path, pure_path, sid, _ in selected:
+        x = _to_3d(np.load(nos_path))
+        y = _to_3d(np.load(pure_path))
+        if x.shape[0] != y.shape[0]:
+            raise ValueError(
+                f"Subject count mismatch: {nos_path.name} vs {pure_path.name}"
+            )
+        t = min(x.shape[-1], y.shape[-1])
+        c = min(x.shape[1], y.shape[1])
+        min_t = t if min_t is None else min(min_t, t)
+        min_c = c if min_c is None else min(min_c, c)
+        xs.append(x)
+        ys.append(y)
+        sids.append(sid)
+
+    x_aligned = [x[:, :min_c, :min_t] for x in xs]
+    y_aligned = [y[:, :min_c, :min_t] for y in ys]
+    x_merged = np.concatenate(x_aligned, axis=0).astype(np.float32)
+    y_merged = np.concatenate(y_aligned, axis=0).astype(np.float32)
+
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    nos_merged = merged_dir / f"Contaminated_top_pool_merged_{timestamp}.npy"
+    pure_merged = merged_dir / f"Pure_top_pool_merged_{timestamp}.npy"
+    np.save(nos_merged, x_merged)
+    np.save(pure_merged, y_merged)
+
+    print(f"Merged NOS: {nos_merged} shape={x_merged.shape}")
+    print(f"Merged EEG: {pure_merged} shape={y_merged.shape}")
+    run_suffix = f"top{len(sids)}_{'_'.join(sids)}"
+    if len(run_suffix) > 120:
+        run_suffix = f"top{len(sids)}"
+    return pure_merged, nos_merged, run_suffix
+
+
 def main() -> None:
     args = parse_args()
     project_root = Path(__file__).resolve().parents[1]
@@ -161,14 +228,18 @@ def main() -> None:
             f"No matched pairs for combo={args.combo} in {contaminated_dir}"
         )
 
-    nos_path, pure_path, sid, _ = _pick_one_top15(
+    selected = _pick_topk_from_pool(
         pairs=pairs,
         top_ratio=args.top_ratio,
         min_len=args.min_len,
         seed=args.seed,
+        pick_count=args.pick_count,
     )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    merged_dir = contaminated_dir / "merged"
+    eeg_merged, nos_merged, run_suffix = _merge_selected(selected, merged_dir, timestamp)
 
-    _run_training(args, pure_path, nos_path, sid)
+    _run_training(args, eeg_merged, nos_merged, run_suffix)
 
 
 if __name__ == "__main__":

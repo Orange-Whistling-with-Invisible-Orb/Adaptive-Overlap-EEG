@@ -51,9 +51,60 @@ def main() -> None:
     parser.add_argument("--window-sec", type=float, default=2.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--snr-min",
+        type=float,
+        default=-1.0,
+        help=(
+            "Minimum contamination SNR (dB) forwarded to _contaminator.py. "
+            "Higher values mean contaminated data stays closer to pure."
+        ),
+    )
+    parser.add_argument(
+        "--snr-max",
+        type=float,
+        default=5.0,
+        help=(
+            "Maximum contamination SNR (dB) forwarded to _contaminator.py. "
+            "Default range [-1, 5] keeps moderate noise while preserving morphology."
+        ),
+    )
+    parser.add_argument(
         "--noise-dir-name", choices=["auto", "noise", "nosie"], default="auto"
     )
+    parser.add_argument(
+        "--disable-tail-drop-trim",
+        action="store_true",
+        help="Disable auto tail-drop anomaly trimming for EDF inputs.",
+    )
+    parser.add_argument(
+        "--tail-drop-search-sec",
+        type=float,
+        default=5.0,
+        help="Only search drop in last N seconds.",
+    )
+    parser.add_argument(
+        "--tail-drop-min-persist-sec",
+        type=float,
+        default=0.8,
+        help="Drop condition must persist at least this duration.",
+    )
+    parser.add_argument(
+        "--tail-drop-rms-ratio",
+        type=float,
+        default=0.25,
+        help="RMS drop ratio threshold vs baseline median.",
+    )
+    parser.add_argument(
+        "--tail-drop-mean-z",
+        type=float,
+        default=6.0,
+        help="Mean drop threshold in robust z-score.",
+    )
     args = parser.parse_args()
+    if args.snr_min > args.snr_max:
+        raise ValueError(
+            f"--snr-min must be <= --snr-max, got {args.snr_min} > {args.snr_max}"
+        )
 
     root = Path(args.project_root).resolve()
     gt_dir = (root / args.ground_truth_dir).resolve()
@@ -77,6 +128,21 @@ def main() -> None:
         raise FileNotFoundError(f"No .edf files found in {gt_dir}")
 
     py = sys.executable
+    tail_args: list[str] = []
+    if args.disable_tail_drop_trim:
+        tail_args.append("--disable-tail-drop-trim")
+    tail_args.extend(
+        [
+            "--tail-drop-search-sec",
+            str(args.tail_drop_search_sec),
+            "--tail-drop-min-persist-sec",
+            str(args.tail_drop_min_persist_sec),
+            "--tail-drop-rms-ratio",
+            str(args.tail_drop_rms_ratio),
+            "--tail-drop-mean-z",
+            str(args.tail_drop_mean_z),
+        ]
+    )
 
     for edf in edf_files:
         sid = edf.stem
@@ -105,6 +171,7 @@ def main() -> None:
                 "--out-npy",
                 str(clean_npy),
             ]
+            + tail_args
         )
 
         run_cmd(
@@ -128,6 +195,7 @@ def main() -> None:
                 "--output-prefix",
                 f"EMG_epochs_{sid}",
             ]
+            + tail_args
         )
 
         run_cmd(
@@ -155,6 +223,7 @@ def main() -> None:
                 "--output-prefix",
                 f"EOG_epochs_{sid}",
             ]
+            + tail_args
         )
 
         target_n = int(np.load(clean_npy).shape[0])
@@ -238,7 +307,12 @@ def main() -> None:
                 str(pure_out),
                 "--seed",
                 str(args.seed),
+                "--snr-min",
+                str(args.snr_min),
+                "--snr-max",
+                str(args.snr_max),
             ]
+            + tail_args
         )
 
     print("\nAll EDF files processed.")

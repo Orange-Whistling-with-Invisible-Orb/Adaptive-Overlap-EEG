@@ -14,29 +14,75 @@ PACKET_SAMPLES = 60
 
 
 class BasicPreprocessor:
-    """基本脑电预处理：带通 + 按通道标准化"""
+    """
+    基本脑电预处理，支持两种模式：
+    1) normal: 正常预处理（带通 + 按通道标准化）
+    2) none:   不做预处理（原样返回）
+    """
 
-    def __init__(self, sample_rate=200):
+    def __init__(self, sample_rate=200, preprocess_mode=1):
         self.sample_rate = sample_rate
         self.filter_coefficients = self._design_filters()
+        self.preprocess_mode = self._normalize_mode(preprocess_mode)
 
     def _design_filters(self):
         b, a = butter(4, [0.5, 40], btype="bandpass", fs=self.sample_rate)
         return b, a
 
-    def preprocess(self, data):
-        # 注意：这里按包（60个点）进行filtfilt滤波可能会有边缘效应，
-        # 实际严谨的做法是将滤波也放到长窗口中。这里暂时保留原逻辑。
-        processed_data = np.copy(data)
+    @staticmethod
+    def _normalize_mode(preprocess_mode):
+        mapping = {
+            1: "normal",
+            2: "none",
+            "1": "normal",
+            "2": "none",
+            "normal": "normal",
+            "none": "none",
+            # 兼容旧参数：历史上的 mode=3(劣化) 现已撤回，按 normal 处理
+            3: "normal",
+            "3": "normal",
+            "worsen": "normal",
+        }
+        mode = mapping.get(preprocess_mode, "normal")
+        return mode
+
+    @staticmethod
+    def _channel_zscore(data):
+        mean = np.mean(data, axis=1, keepdims=True)
+        std = np.std(data, axis=1, keepdims=True) + 1e-8
+        return (data - mean) / std
+
+    def _safe_bandpass(self, data):
+        """
+        在样本点太短时跳过滤波，避免 filtfilt 报错。
+        """
+        filtered = np.copy(data)
         b, a = self.filter_coefficients
+        # scipy.signal.filtfilt 要求输入长度严格大于 padlen
+        # 这里按默认 padlen=3*max(len(a), len(b)) 做保守判断。
+        padlen = 3 * max(len(a), len(b))
+        if filtered.shape[1] <= padlen:
+            return filtered
 
-        for i in range(processed_data.shape[0]):
-            processed_data[i, :] = filtfilt(b, a, processed_data[i, :])
+        for i in range(filtered.shape[0]):
+            try:
+                filtered[i, :] = filtfilt(b, a, filtered[i, :])
+            except ValueError:
+                # 极端边界情况下，回退原始信号，避免中断在线流程/训练流程
+                filtered[i, :] = data[i, :]
+        return filtered
 
-        mean = np.mean(processed_data, axis=1, keepdims=True)
-        std = np.std(processed_data, axis=1, keepdims=True) + 1e-8
-        processed_data = (processed_data - mean) / std
-        return processed_data
+    def preprocess(self, data):
+        x = np.asarray(data, dtype=np.float32)
+
+        if self.preprocess_mode == "none":
+            return np.copy(x)
+
+        if self.preprocess_mode == "normal":
+            x = self._safe_bandpass(x)
+            x = self._channel_zscore(x)
+            return x.astype(np.float32)
+        return np.copy(x)
 
 
 class EEGReceiver(threading.Thread):
@@ -212,12 +258,21 @@ class StreamDispatcher(threading.Thread):
     任务：从队列拿数据 -> 基础预处理 -> 喂给自适应窗口管理器
     """
 
-    def __init__(self, receiver, window_manager, sample_rate=200, on_packet_received=None):
+    def __init__(
+        self,
+        receiver,
+        window_manager,
+        sample_rate=200,
+        on_packet_received=None,
+        preprocess_mode=1,
+    ):
         super().__init__()
         self.daemon = True  # 设置为守护线程，程序退出时自动终止
         self.receiver = receiver
         self.running = True
-        self.preprocessor = BasicPreprocessor(sample_rate=sample_rate)
+        self.preprocessor = BasicPreprocessor(
+            sample_rate=sample_rate, preprocess_mode=preprocess_mode
+        )
         # 核心：持有窗口管理器的引用
         self.window_manager = window_manager
         self.packet_count = 0

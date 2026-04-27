@@ -16,8 +16,9 @@ class DualScalePositionScorer(nn.Module):
           - L: 窗口长度
 
     输出:
-        logits:  [B, K]
-        weights: [B, K]  (沿 K 维 softmax 归一化)
+        logits:  [B, K, T]
+        weights: [B, K, T]  (对每个时刻 t 沿 K 维 softmax 归一化)
+        其中 T = output_len（未指定时 T=L）。
     """
 
     def __init__(self, n_channels: int, window_len: int, local_kernel: int = 15):
@@ -56,7 +57,9 @@ class DualScalePositionScorer(nn.Module):
             in_channels=self.n_channels, out_channels=1, kernel_size=1, bias=True
         )
 
-    def forward(self, windows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, windows: torch.Tensor, output_len: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if windows.ndim != 4:
             raise ValueError(
                 f"DualScalePositionScorer expects 4D input [B,K,C,L], got {windows.shape}"
@@ -70,18 +73,23 @@ class DualScalePositionScorer(nn.Module):
             raise ValueError(
                 f"Window length mismatch: expected {self.window_len}, got {win_len}"
             )
+        if output_len is None:
+            output_len = win_len
+        output_len = int(output_len)
+        if output_len < 1 or output_len > win_len:
+            raise ValueError(
+                f"output_len must be in [1, {win_len}], got {output_len}"
+            )
 
         # [B,K,C,L] -> [B*K,C,L]
         x = windows.reshape(bsz * n_win, n_ch, win_len)
 
+        # 局部分支保留时序分辨率，支持位置相关权重 w_k[t]
         local_feat = self.local_dwconv(x)  # [B*K,C,L]
-        local_feat = torch.amax(local_feat, dim=-1, keepdim=True)  # GMP -> [B*K,C,1]
-
         global_feat = self.global_conv(x)  # [B*K,C,1]
-
-        merged_feat = local_feat + global_feat  # 尺度叠加
-        logit = self.vote_conv(merged_feat)  # [B*K,1,1]
-        logits = logit.view(bsz, n_win)
+        merged_feat = local_feat + global_feat  # 全局特征按时间广播
+        logit_map = self.vote_conv(merged_feat).squeeze(1)  # [B*K,L]
+        logits = logit_map.view(bsz, n_win, win_len)[:, :, :output_len]  # [B,K,T]
         weights = torch.softmax(logits, dim=1)
         return logits, weights
 
@@ -92,12 +100,26 @@ def fuse_windows_with_weights(
     """
     将窗口按 softmax 权重融合。
 
-    windows: [B, K, C, L]
-    weights: [B, K]
-    return:  [B, C, L]
+    windows: [B, K, C, T]
+    weights: [B, K, T] 或 [B, K]
+    return:  [B, C, T]
     """
-    if windows.ndim != 4 or weights.ndim != 2:
+    if windows.ndim != 4:
         raise ValueError(
             f"Invalid shapes: windows={windows.shape}, weights={weights.shape}"
         )
-    return (weights[:, :, None, None] * windows).sum(dim=1)
+    if weights.ndim == 2:
+        weights = weights[:, :, None]
+    if weights.ndim != 3:
+        raise ValueError(
+            f"Invalid shapes: windows={windows.shape}, weights={weights.shape}"
+        )
+    if (
+        windows.shape[0] != weights.shape[0]
+        or windows.shape[1] != weights.shape[1]
+        or windows.shape[3] != weights.shape[2]
+    ):
+        raise ValueError(
+            f"Shape mismatch: windows={windows.shape}, weights={weights.shape}"
+        )
+    return (weights[:, :, None, :] * windows).sum(dim=1)

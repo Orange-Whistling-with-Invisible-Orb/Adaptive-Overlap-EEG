@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import random
+import secrets
 from datetime import datetime
 from pathlib import Path
 
@@ -11,6 +12,31 @@ import numpy as np
 import torch
 
 from core_algorithm.training.online_trainer import StreamingFusionTrainer
+
+
+def _parse_init_window_weights(raw: str) -> list[float]:
+    txt = str(raw).strip()
+    if not txt:
+        return []
+    parts = [p.strip() for p in txt.split(",")]
+    vals = []
+    for p in parts:
+        if not p:
+            continue
+        vals.append(float(p))
+    if len(vals) == 0:
+        raise argparse.ArgumentTypeError(
+            "--init_window_weights 需要逗号分隔浮点数，例如: 0.5,0.3,0.2"
+        )
+    return vals
+
+
+def _build_init_weight_tag(weights: list[float]) -> str:
+    vals = [f"{float(v):.3f}".rstrip("0").rstrip(".") for v in weights]
+    safe = [v.replace(".", "p") if v else "0" for v in vals]
+    if len(safe) > 6:
+        safe = safe[:6] + [f"k{len(vals)}"]
+    return "initw_" + "_".join(safe)
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,8 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="data/contaminated",
-        help="数据目录，包含 Contaminated_*.npy 与 Pure_*.npy",
+        required=True,
+        help="数据目录（必填），包含 Contaminated_*.npy 与 Pure_*.npy",
     )
     parser.add_argument(
         "--combo",
@@ -53,7 +79,19 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="longest",
         choices=["longest", "random"],
-        help="自动选样策略：最长样本或随机样本",
+        help="自动选样策略：最长样本优先或随机抽样",
+    )
+    parser.add_argument(
+        "--pick_count",
+        type=int,
+        default=5,
+        help="自动选样时联合训练的数据对数量（默认 5）",
+    )
+    parser.add_argument(
+        "--min_pair_len",
+        type=int,
+        default=0,
+        help="自动选样时最小长度阈值（单位: 采样点，默认 0 表示不过滤）",
     )
 
     parser.add_argument(
@@ -66,15 +104,79 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=30, help="训练轮数")
     parser.add_argument("--lr", type=float, default=1e-3, help="学习率")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="权重衰减")
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument(
+        "--lr_patience",
+        type=int,
+        default=4,
+        help="验证集无改进时触发降学习率的等待 epoch 数",
+    )
+    parser.add_argument(
+        "--lr_factor",
+        type=float,
+        default=0.5,
+        help="触发降学习率时的乘法因子",
+    )
+    parser.add_argument(
+        "--min_lr",
+        type=float,
+        default=1e-5,
+        help="学习率下限",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="随机种子（不传则每次自动随机）",
+    )
+    parser.add_argument(
+        "--folds",
+        type=int,
+        default=1,
+        help="交叉验证折数（当前 train.py 仅支持 1）",
+    )
 
     parser.add_argument("--window_len", type=int, default=500, help="滑窗长度 L")
     parser.add_argument("--overlap_n", type=int, default=3, help="重叠参数 N")
     parser.add_argument("--packet_samples", type=int, default=60, help="每包样本点数")
+    parser.add_argument("--sample_rate", type=float, default=200.0, help="采样率(Hz)")
+    parser.add_argument(
+        "--preprocess_mode",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="基础预处理模式: 1=正常预处理(默认), 2=不预处理",
+    )
     parser.add_argument("--val_ratio", type=float, default=0.2, help="验证集比例")
     parser.add_argument("--local_kernel", type=int, default=15, help="局部分支卷积核")
     parser.add_argument("--mse_weight", type=float, default=1.0, help="MSE loss 权重")
     parser.add_argument("--l1_weight", type=float, default=0.0, help="L1 loss 权重")
+    parser.add_argument(
+        "--entropy_reg_weight",
+        type=float,
+        default=0.01,
+        help="权重熵正则系数（>0 可抑制 one-hot 塌缩）",
+    )
+    parser.add_argument(
+        "--softmax_temperature",
+        type=float,
+        default=1.0,
+        help="权重 softmax 温度（>1 更平滑，<1 更尖锐）",
+    )
+    parser.add_argument(
+        "--init_logit_bias_strength",
+        type=float,
+        default=0.35,
+        help="初始logit位置先验强度（避免初始接近1/K均分）",
+    )
+    parser.add_argument(
+        "--init_window_weights",
+        type=_parse_init_window_weights,
+        default=None,
+        help=(
+            "手动指定初始窗口权重(逗号分隔, 如 0.6,0.3,0.1)。"
+            "传入后将覆盖 --init_logit_bias_strength 的位置先验。"
+        ),
+    )
 
     parser.add_argument("--results_dir", type=str, default="results", help="结果根目录")
     parser.add_argument("--run_name", type=str, default="", help="手动指定运行名")
@@ -112,7 +214,35 @@ def _derive_pure_path_from_contaminated(contaminated_path: Path) -> Path:
     return contaminated_path.with_name(f"Pure_{sid}{contaminated_path.suffix}")
 
 
-def _resolve_pair(args: argparse.Namespace, project_root: Path) -> tuple[Path, Path]:
+def _collect_auto_pairs(
+    args: argparse.Namespace, project_root: Path
+) -> list[tuple[int, Path, Path]]:
+    data_dir = (project_root / args.data_dir).resolve()
+    if not data_dir.exists():
+        raise FileNotFoundError(f"data_dir not found: {data_dir}")
+    cands = sorted(data_dir.glob(f"Contaminated_{args.combo}_*.npy"))
+    if args.sid.strip():
+        cands = [p for p in cands if p.stem.endswith(args.sid)]
+
+    pairs = []
+    for c in cands:
+        p = _derive_pure_path_from_contaminated(c)
+        if not p.exists():
+            continue
+        try:
+            arr_c = np.load(c, mmap_mode="r")
+            arr_p = np.load(p, mmap_mode="r")
+            t = min(int(arr_c.shape[-1]), int(arr_p.shape[-1]))
+        except Exception:
+            continue
+        if t >= int(args.min_pair_len):
+            pairs.append((t, c, p))
+    return pairs
+
+
+def _resolve_pairs(
+    args: argparse.Namespace, project_root: Path
+) -> list[tuple[int, Path, Path]]:
     if args.contaminated_path.strip():
         cont_path = (project_root / args.contaminated_path).resolve()
         pure_path = (
@@ -124,45 +254,55 @@ def _resolve_pair(args: argparse.Namespace, project_root: Path) -> tuple[Path, P
             raise FileNotFoundError(f"Contaminated file not found: {cont_path}")
         if not pure_path.exists():
             raise FileNotFoundError(f"Pure file not found: {pure_path}")
-        return cont_path, pure_path
+        try:
+            arr_c = np.load(cont_path, mmap_mode="r")
+            arr_p = np.load(pure_path, mmap_mode="r")
+            t = min(int(arr_c.shape[-1]), int(arr_p.shape[-1]))
+        except Exception:
+            t = 0
+        return [(t, cont_path, pure_path)]
 
-    data_dir = (project_root / args.data_dir).resolve()
-    if not data_dir.exists():
-        raise FileNotFoundError(f"data_dir not found: {data_dir}")
-    cands = sorted(data_dir.glob(f"Contaminated_{args.combo}_*.npy"))
-    if args.sid.strip():
-        cands = [p for p in cands if p.stem.endswith(args.sid)]
-    pairs = []
-    for c in cands:
-        p = _derive_pure_path_from_contaminated(c)
-        if p.exists():
-            try:
-                arr = np.load(c, mmap_mode="r")
-                t = arr.shape[-1]
-            except Exception:
-                continue
-            pairs.append((int(t), c, p))
+    pairs = _collect_auto_pairs(args, project_root)
     if not pairs:
         raise FileNotFoundError(
-            f"No matched contaminated/pure pairs found in {data_dir} for combo={args.combo} sid={args.sid}"
+            "No matched contaminated/pure pairs found for auto selection. "
+            f"combo={args.combo}, sid={args.sid}, min_pair_len={args.min_pair_len}"
         )
+
+    pick_count = max(1, int(args.pick_count))
     if args.pick == "random":
-        idx = random.randint(0, len(pairs) - 1)
-        _, cont_path, pure_path = pairs[idx]
-    else:
-        pairs.sort(key=lambda z: z[0], reverse=True)
-        _, cont_path, pure_path = pairs[0]
-    return cont_path, pure_path
+        if pick_count >= len(pairs):
+            return pairs
+        return random.sample(pairs, k=pick_count)
+
+    pairs.sort(key=lambda z: z[0], reverse=True)
+    return pairs[:pick_count]
 
 
-def _load_aligned_pair(cont_path: Path, pure_path: Path, n_channels: int = 19):
-    cont = _to_3d(np.load(cont_path), n_channels=n_channels)
-    pure = _to_3d(np.load(pure_path), n_channels=n_channels)
-    s = min(cont.shape[0], pure.shape[0])
-    t = min(cont.shape[2], pure.shape[2])
-    cont = cont[:s, :, :t]
-    pure = pure[:s, :, :t]
-    return cont.astype(np.float32), pure.astype(np.float32)
+def _load_aligned_pairs(
+    pairs: list[tuple[int, Path, Path]], n_channels: int = 19
+) -> tuple[np.ndarray, np.ndarray]:
+    cont_list = []
+    pure_list = []
+    global_t = None
+
+    for _, cont_path, pure_path in pairs:
+        cont = _to_3d(np.load(cont_path), n_channels=n_channels)
+        pure = _to_3d(np.load(pure_path), n_channels=n_channels)
+        s = min(cont.shape[0], pure.shape[0])
+        t = min(cont.shape[2], pure.shape[2])
+        cont = cont[:s, :, :t]
+        pure = pure[:s, :, :t]
+        global_t = t if global_t is None else min(global_t, t)
+        cont_list.append(cont)
+        pure_list.append(pure)
+
+    if not cont_list or global_t is None:
+        raise RuntimeError("No valid pairs after loading and alignment.")
+
+    cont_out = np.concatenate([x[:, :, :global_t] for x in cont_list], axis=0)
+    pure_out = np.concatenate([x[:, :, :global_t] for x in pure_list], axis=0)
+    return cont_out.astype(np.float32), pure_out.astype(np.float32)
 
 
 def _split_samples(
@@ -211,22 +351,36 @@ def _save_json(path: Path, obj):
 
 def main():
     args = parse_args()
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    if int(args.folds) != 1:
+        raise ValueError(
+            f"train.py 当前仅支持 --folds 1（收到 {args.folds}）。"
+            "该脚本为单次 train/val 划分流程，不执行 K-fold。"
+        )
+    if args.seed is None:
+        used_seed = None
+        seed_mode = "no_seed"
+    else:
+        used_seed = int(args.seed)
+        seed_mode = "fixed"
+        random.seed(used_seed)
+        np.random.seed(used_seed)
+        torch.manual_seed(used_seed)
+    print(f"[Init] seed_mode={seed_mode}, seed={used_seed}")
 
     project_root = Path(__file__).resolve().parent
     stfnet_ckpt = (project_root / args.stfnet_ckpt).resolve()
     if not stfnet_ckpt.exists():
         raise FileNotFoundError(f"STFNet checkpoint not found: {stfnet_ckpt}")
 
-    cont_path, pure_path = _resolve_pair(args, project_root)
-    print("[Init] selected pair:")
-    print(f"  contaminated: {cont_path}")
-    print(f"  pure        : {pure_path}")
+    selected_pairs = _resolve_pairs(args, project_root)
+    print(f"[Init] selected pairs: {len(selected_pairs)}")
+    for idx, (t, cont_path, pure_path) in enumerate(selected_pairs, start=1):
+        print(f"  [{idx}] contaminated: {cont_path}")
+        print(f"      pure        : {pure_path}")
+        print(f"      min_t       : {t}")
     print(f"  stfnet_ckpt : {stfnet_ckpt}")
 
-    contaminated, pure = _load_aligned_pair(cont_path, pure_path, n_channels=19)
+    contaminated, pure = _load_aligned_pairs(selected_pairs, n_channels=19)
     print(
         f"[Data] loaded shape contaminated={contaminated.shape}, pure={pure.shape}"
     )
@@ -237,12 +391,35 @@ def main():
     )
     print(
         f"[Data] train_samples={len(train_samples)}, val_samples={len(val_samples)}, "
-        f"L={args.window_len}, N={args.overlap_n}, S={step_size}, packet={args.packet_samples}"
+        f"L={args.window_len}, N={args.overlap_n}, S={step_size}, "
+        f"packet={args.packet_samples}, preprocess_mode={args.preprocess_mode}"
     )
+    if args.init_window_weights is not None:
+        print(
+            f"[Init] init_window_weights(raw)={args.init_window_weights} "
+            f"(will be normalized in trainer)"
+        )
 
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sid = pure_path.stem.replace("Pure_", "")
-    run_name = args.run_name or f"N{args.overlap_n}_fusion_weight_{now}_{sid}"
+    sid = (
+        selected_pairs[0][2].stem.replace("Pure_", "")
+        if len(selected_pairs) == 1
+        else f"multi{len(selected_pairs)}"
+    )
+    init_weight_tag = (
+        _build_init_weight_tag(args.init_window_weights)
+        if args.init_window_weights is not None
+        else ""
+    )
+    if args.run_name:
+        run_name = args.run_name
+        if init_weight_tag and init_weight_tag not in run_name:
+            run_name = f"{run_name}_{init_weight_tag}"
+    else:
+        if init_weight_tag:
+            run_name = f"N{args.overlap_n}_fusion_weight_{init_weight_tag}_{now}_{sid}"
+        else:
+            run_name = f"N{args.overlap_n}_fusion_weight_{now}_{sid}"
     run_dir = (project_root / args.results_dir / run_name).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Run] results dir: {run_dir}")
@@ -254,52 +431,137 @@ def main():
         overlap_n=args.overlap_n,
         packet_samples=args.packet_samples,
         device=args.device,
+        sample_rate=args.sample_rate,
+        preprocess_mode=args.preprocess_mode,
         lr=args.lr,
         weight_decay=args.weight_decay,
         local_kernel=args.local_kernel,
         mse_weight=args.mse_weight,
         l1_weight=args.l1_weight,
+        entropy_reg_weight=args.entropy_reg_weight,
+        softmax_temperature=args.softmax_temperature,
+        init_logit_bias_strength=args.init_logit_bias_strength,
+        init_window_weights=args.init_window_weights,
     )
 
     config = {
-        "contaminated_path": str(cont_path),
-        "pure_path": str(pure_path),
+        "contaminated_path": (
+            str(selected_pairs[0][1]) if len(selected_pairs) == 1 else "MULTI_SELECTED"
+        ),
+        "pure_path": (
+            str(selected_pairs[0][2]) if len(selected_pairs) == 1 else "MULTI_SELECTED"
+        ),
+        "selected_pairs": [
+            {"contaminated": str(c), "pure": str(p), "time_len": int(t)}
+            for t, c, p in selected_pairs
+        ],
         "stfnet_ckpt": str(stfnet_ckpt),
+        "pick": args.pick,
+        "pick_count": args.pick_count,
+        "min_pair_len": args.min_pair_len,
         "device": args.device,
         "epochs": args.epochs,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
+        "lr_patience": args.lr_patience,
+        "lr_factor": args.lr_factor,
+        "min_lr": args.min_lr,
         "window_len": args.window_len,
         "overlap_n": args.overlap_n,
         "step_size": step_size,
         "packet_samples": args.packet_samples,
+        "sample_rate": args.sample_rate,
+        "preprocess_mode": args.preprocess_mode,
         "val_ratio": args.val_ratio,
         "local_kernel": args.local_kernel,
         "mse_weight": args.mse_weight,
         "l1_weight": args.l1_weight,
+        "entropy_reg_weight": args.entropy_reg_weight,
+        "softmax_temperature": args.softmax_temperature,
+        "init_logit_bias_strength": args.init_logit_bias_strength,
+        "init_window_weights": args.init_window_weights,
         "seed": args.seed,
+        "folds": args.folds,
+        "seed_mode": seed_mode,
+        "seed_used": used_seed,
     }
     _save_json(run_dir / "config.json", config)
 
     metrics_csv = run_dir / "metrics.csv"
+    weights_csv = run_dir / "weights_trace.csv"
     best_ckpt = run_dir / "best_weight_network.pth"
     last_ckpt = run_dir / "last_weight_network.pth"
     best_val = float("inf")
     history = []
+    max_w_cols = max(1, int((args.window_len + step_size - 1) // step_size))
 
-    with open(metrics_csv, "w", newline="", encoding="utf-8") as fcsv:
+    with open(metrics_csv, "w", newline="", encoding="utf-8") as fcsv, open(
+        weights_csv, "w", newline="", encoding="utf-8"
+    ) as fw:
         writer = csv.writer(fcsv)
-        writer.writerow(
-            [
-                "epoch",
-                "train_loss",
-                "train_chunks",
-                "val_loss",
-                "val_chunks",
-                "train_sec",
-                "val_sec",
-            ]
+        w_writer = csv.writer(fw)
+
+        metric_header = [
+            "epoch",
+            "lr",
+            "train_chunks",
+            "val_chunks",
+            "train_loss",
+            "val_loss",
+            "train_mse",
+            "val_mse",
+            "train_snr_db",
+            "val_snr_db",
+            "train_weight_entropy_mean",
+            "val_weight_entropy_mean",
+            "train_weight_max_mean",
+            "val_weight_max_mean",
+            "train_effective_k_mean",
+            "val_effective_k_mean",
+        ]
+        metric_header.extend([f"train_w{i}" for i in range(1, max_w_cols + 1)])
+        metric_header.extend([f"val_w{i}" for i in range(1, max_w_cols + 1)])
+        writer.writerow(metric_header)
+
+        w_header = [
+            "epoch",
+            "mode",
+            "subject_idx",
+            "chunk_idx",
+            "k_active",
+            "effective_k",
+            "entropy",
+            "max_weight",
+            "mse",
+            "snr_db",
+        ] + [f"w{i}" for i in range(1, max_w_cols + 1)]
+        w_writer.writerow(w_header)
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            trainer.optimizer,
+            mode="min",
+            factor=float(args.lr_factor),
+            patience=int(max(1, args.lr_patience)),
+            min_lr=float(args.min_lr),
         )
+
+        def write_weight_rows(records):
+            for rec in records:
+                w = rec["weights"]
+                wr = [
+                    rec["epoch"],
+                    rec["mode"],
+                    rec["subject_idx"],
+                    rec["chunk_idx"],
+                    rec["k_active"],
+                    rec.get("effective_k", 0.0),
+                    rec["entropy"],
+                    rec["max_weight"],
+                    rec.get("mse", 0.0),
+                    rec.get("snr_db", 0.0),
+                ]
+                wr.extend(w + [0.0] * (max_w_cols - len(w)))
+                w_writer.writerow(wr)
 
         for epoch in range(1, args.epochs + 1):
             print(f"\n[Epoch {epoch}/{args.epochs}] ------------------------------")
@@ -316,18 +578,49 @@ def main():
                 f"val_loss={val_stat['mean_loss']:.6f} "
                 f"(chunks={val_stat['chunks']}, {val_stat['elapsed_sec']:.2f}s)"
             )
-
-            writer.writerow(
-                [
-                    epoch,
-                    train_stat["mean_loss"],
-                    train_stat["chunks"],
-                    val_stat["mean_loss"],
-                    val_stat["chunks"],
-                    train_stat["elapsed_sec"],
-                    val_stat["elapsed_sec"],
-                ]
+            print(
+                f"[Epoch {epoch:03d}] mse(train/val)="
+                f"{train_stat['mean_mse']:.6f}/{val_stat['mean_mse']:.6f}, "
+                f"snr_db(train/val)="
+                f"{train_stat['mean_snr_db']:.3f}/{val_stat['mean_snr_db']:.3f}"
             )
+            print(
+                f"[Epoch {epoch:03d}] weight(train): entropy={train_stat['weight_entropy_mean']:.4f}, "
+                f"max={train_stat['weight_max_mean']:.4f}; "
+                f"effective_k={train_stat['mean_effective_k']:.3f}; "
+                f"weight(val): entropy={val_stat['weight_entropy_mean']:.4f}, "
+                f"effective_k={val_stat['mean_effective_k']:.3f}, "
+                f"max={val_stat['weight_max_mean']:.4f}"
+            )
+
+            row = [
+                epoch,
+                float(trainer.optimizer.param_groups[0]["lr"]),
+                train_stat["chunks"],
+                val_stat["chunks"],
+                train_stat["mean_loss"],
+                val_stat["mean_loss"],
+                train_stat["mean_mse"],
+                val_stat["mean_mse"],
+                train_stat["mean_snr_db"],
+                val_stat["mean_snr_db"],
+                train_stat["weight_entropy_mean"],
+                val_stat["weight_entropy_mean"],
+                train_stat["weight_max_mean"],
+                val_stat["weight_max_mean"],
+                train_stat["mean_effective_k"],
+                val_stat["mean_effective_k"],
+            ]
+            train_means = train_stat["weight_means"]
+            val_means = val_stat["weight_means"]
+            row.extend(train_means + [0.0] * (max_w_cols - len(train_means)))
+            row.extend(val_means + [0.0] * (max_w_cols - len(val_means)))
+            writer.writerow(row)
+
+            scheduler.step(val_stat["mean_loss"])
+
+            write_weight_rows(train_stat["weight_records"])
+            write_weight_rows(val_stat["weight_records"])
 
             ckpt_obj = {
                 "state_dict": trainer.scorer.state_dict(),
@@ -336,9 +629,23 @@ def main():
                 "local_kernel": args.local_kernel,
                 "overlap_n": args.overlap_n,
                 "packet_samples": args.packet_samples,
+                "sample_rate": args.sample_rate,
+                "preprocess_mode": args.preprocess_mode,
+                "entropy_reg_weight": args.entropy_reg_weight,
+                "softmax_temperature": args.softmax_temperature,
+                "init_logit_bias_strength": args.init_logit_bias_strength,
+                "init_window_weights": args.init_window_weights,
                 "epoch": epoch,
                 "train_loss": float(train_stat["mean_loss"]),
                 "val_loss": float(val_stat["mean_loss"]),
+                "train_recon_loss": float(train_stat["mean_recon_loss"]),
+                "val_recon_loss": float(val_stat["mean_recon_loss"]),
+                "train_mse": float(train_stat["mean_mse"]),
+                "val_mse": float(val_stat["mean_mse"]),
+                "train_snr_db": float(train_stat["mean_snr_db"]),
+                "val_snr_db": float(val_stat["mean_snr_db"]),
+                "train_effective_k": float(train_stat["mean_effective_k"]),
+                "val_effective_k": float(val_stat["mean_effective_k"]),
                 "stfnet_checkpoint": str(stfnet_ckpt),
             }
             torch.save(ckpt_obj, last_ckpt)
@@ -354,6 +661,16 @@ def main():
                     "epoch": epoch,
                     "train_loss": float(train_stat["mean_loss"]),
                     "val_loss": float(val_stat["mean_loss"]),
+                    "train_mse": float(train_stat["mean_mse"]),
+                    "val_mse": float(val_stat["mean_mse"]),
+                    "train_snr_db": float(train_stat["mean_snr_db"]),
+                    "val_snr_db": float(val_stat["mean_snr_db"]),
+                    "train_effective_k": float(train_stat["mean_effective_k"]),
+                    "val_effective_k": float(val_stat["mean_effective_k"]),
+                    "train_weight_entropy_mean": float(
+                        train_stat["weight_entropy_mean"]
+                    ),
+                    "val_weight_entropy_mean": float(val_stat["weight_entropy_mean"]),
                 }
             )
 
@@ -372,6 +689,7 @@ def main():
     print(f"  best checkpoint : {best_ckpt}")
     print(f"  last checkpoint : {last_ckpt}")
     print(f"  metrics csv     : {metrics_csv}")
+    print(f"  weights csv     : {weights_csv}")
 
 
 if __name__ == "__main__":
