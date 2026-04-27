@@ -23,18 +23,22 @@
 
 ## 环境依赖
 
-建议 Python 3.10+，核心依赖包括：
+建议 Python 3.10+，并使用 `requirements.txt` 统一安装依赖。
+
+```bash
+pip install -r requirements.txt
+```
+
+当前依赖覆盖训练、流式预处理、EDF 处理与可视化脚本，包含：
 
 - `numpy`
 - `scipy`
 - `torch`
 - `tqdm`
-
-可按需自行安装，例如：
-
-```bash
-pip install numpy scipy torch tqdm
-```
+- `scikit-learn`
+- `einops`
+- `mne`
+- `matplotlib`
 
 ## 使用说明（示例）
 

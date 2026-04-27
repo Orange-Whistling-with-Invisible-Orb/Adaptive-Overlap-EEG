@@ -1,0 +1,8 @@
+numpy
+scipy
+torch
+tqdm
+scikit-learn
+einops
+mne
+matplotlib
